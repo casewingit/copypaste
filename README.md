@@ -18,12 +18,12 @@ Finder에서 build.zip ⌘C
 두 Mac에서 각각 실행합니다. Tailscale 앱이 로그인되어 있고 HTTPS 인증서가 켜져 있어야 합니다.
 
 ```bash
-./install.sh
+bash install.sh
 ```
 
 `~/Applications/Copypaste.app` 으로 설치되고 로그인할 때 자동 실행됩니다. 제거는 `./uninstall.sh` 입니다.
 
-Swift 컴파일러가 없는 Mac에서는 GitHub Releases의 `copypaste-installer.zip` 을 받아 압축을 풀고 `./install.sh` 를 실행하면 빌드 없이 설치됩니다(미리 빌드한 유니버설 앱 포함).
+Swift 컴파일러가 없는 Mac에서는 GitHub Releases의 `copypaste-installer.zip` 을 받아 압축을 풀고 폴더 안에서 `bash install.sh` 를 실행하면 빌드 없이 설치됩니다(미리 빌드한 유니버설 앱 포함).
 
 ## 메뉴 막대
 
