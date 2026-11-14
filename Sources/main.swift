@@ -237,6 +237,7 @@ final class Conn {
     let c: NWConnection
     let q: DispatchQueue
     var buf = Data()
+    var what = ""  // 로그용: "파일명 <- 요청 기기 주소"
 
     init(_ c: NWConnection) {
         self.c = c
@@ -325,7 +326,8 @@ final class Conn {
         guard share.paths.allSatisfy({ FileManager.default.fileExists(atPath: $0) }) else {
             return text("404 Not Found", "원본 파일이 이동되었거나 삭제되었습니다.\n", headOnly: headOnly)
         }
-        if !headOnly { log("다운로드: \(share.name) <- \(headers["x-forwarded-for"] ?? "?")") }
+        what = "\(share.name) <- \(headers["x-forwarded-for"] ?? "?")"
+        if !headOnly { log("다운로드 시작: \(what)") }
         let disposition = ("Content-Disposition", "attachment; filename*=UTF-8''\(pctEncode(share.name))")
         if share.isArchive {
             sendArchive(share, disposition, headOnly)
@@ -375,10 +377,15 @@ final class Conn {
         let n = Int(min(remaining, 1 << 20))
         guard n > 0, let chunk = try? fh.read(upToCount: n), !chunk.isEmpty else {
             try? fh.close()
+            log(remaining == 0 ? "다운로드 완료: \(what)" : "다운로드 중단(파일 읽기 실패): \(what)")
             return close()
         }
         c.send(content: chunk, completion: .contentProcessed { err in
-            if err != nil { try? fh.close(); self.c.cancel() } else { self.pump(fh, remaining - UInt64(chunk.count)) }
+            if err != nil {
+                try? fh.close()
+                log("다운로드 중단(연결 끊김): \(self.what)")
+                self.c.cancel()
+            } else { self.pump(fh, remaining - UInt64(chunk.count)) }
         })
     }
 
@@ -411,6 +418,8 @@ final class Conn {
     private func pumpZip(_ p: Process, _ fh: FileHandle) {
         let chunk = fh.availableData
         if chunk.isEmpty {
+            p.waitUntilExit()
+            log(p.terminationStatus == 0 ? "다운로드 완료: \(what)" : "다운로드 중단(zip 오류 \(p.terminationStatus)): \(what)")
             return send(Data("0\r\n\r\n".utf8)) { self.close() }
         }
         var framed = Data("\(String(chunk.count, radix: 16))\r\n".utf8)
