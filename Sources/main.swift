@@ -101,6 +101,22 @@ final class Store {
 
 let store = Store()
 
+/// tailscale serve만 아는 비밀 경로. 로컬 포트로 직접 들어오는 요청은 이 값을 모르므로
+/// 헤더를 꾸며도 통과하지 못한다. (같은 Mac의 다른 사용자·샌드박스 앱 차단)
+let upstreamSecret: String = {
+    let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("copypaste")
+    let file = dir.appendingPathComponent("secret")
+    if let s = try? String(contentsOf: file, encoding: .utf8), s.count == 40, s.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber) }) {
+        return s
+    }
+    let alphabet = Array("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+    var rng = SystemRandomNumberGenerator()
+    let s = String((0..<40).map { _ in alphabet.randomElement(using: &rng)! })
+    FileManager.default.createFile(atPath: file.path, contents: Data(s.utf8), attributes: [.posixPermissions: 0o600])
+    return s
+}()
+
 // MARK: - Tailscale
 
 struct Identity {
@@ -140,7 +156,8 @@ final class Tailscale {
 
     /// 이 포트에 이미 다른 serve 설정이 있으면 절대 덮어쓰지 않는다.
     private func ensureServe(host: String) {
-        let target = "http://127.0.0.1:\(localPort)"
+        let base = "http://127.0.0.1:\(localPort)"
+        let target = base + "/" + upstreamSecret
         let (sc, sd) = run(["serve", "status", "--json"])
         guard sc == 0 else { return log("tailscale serve 상태를 읽지 못해 설정을 건드리지 않음") }
         let cfg = (try? JSONSerialization.jsonObject(with: sd) as? [String: Any]) ?? [:]
@@ -148,9 +165,12 @@ final class Tailscale {
         let web = cfg["Web"] as? [String: Any] ?? [:]
         if tcp["\(publicPort)"] != nil {
             let handlers = (web["\(host):\(publicPort)"] as? [String: Any])?["Handlers"] as? [String: Any] ?? [:]
-            let ours = handlers.count == 1 && (handlers["/"] as? [String: Any])?["Proxy"] as? String == target
-            if !ours { log("포트 \(publicPort)에 이미 다른 tailscale serve 설정이 있어 건드리지 않음. COPYPASTE_PORT로 다른 포트를 지정하세요.") }
-            return
+            let proxy = handlers.count == 1 ? (handlers["/"] as? [String: Any])?["Proxy"] as? String : nil
+            if proxy == target { return }
+            // 우리 로컬 포트를 가리키는 예전 설정(비밀 경로 없음/바뀜)만 갱신하고, 남의 설정은 건드리지 않는다.
+            guard let proxy, proxy == base || proxy.hasPrefix(base + "/") else {
+                return log("포트 \(publicPort)에 이미 다른 tailscale serve 설정이 있어 건드리지 않음. COPYPASTE_PORT로 다른 포트를 지정하세요.")
+            }
         }
         let (c, out) = run(["serve", "--bg", "--https=\(publicPort)", target])
         if c != 0 { log("tailscale serve 실패: \(String(data: out, encoding: .utf8) ?? "")") }
@@ -244,6 +264,10 @@ final class Conn {
     let q: DispatchQueue
     var buf = Data()
     var what = ""  // 로그용: "파일명 <- 요청 기기 주소"
+    var gotRequest = false
+    static let lock = NSLock()
+    static var active = 0
+    static let maxActive = 32
 
     init(_ c: NWConnection) {
         self.c = c
@@ -251,7 +275,23 @@ final class Conn {
     }
 
     func start() {
+        Conn.lock.lock()
+        let tooMany = Conn.active >= Conn.maxActive
+        if !tooMany { Conn.active += 1 }
+        Conn.lock.unlock()
+        if tooMany { return c.cancel() }
+        var released = false
+        c.stateUpdateHandler = { state in
+            switch state {
+            case .cancelled, .failed:
+                if !released { released = true; Conn.lock.lock(); Conn.active -= 1; Conn.lock.unlock() }
+                if case .failed = state { self.c.cancel() }
+            default: break
+            }
+        }
         c.start(queue: q)
+        // 요청 헤더를 10초 안에 보내지 않는 연결은 끊는다.
+        q.asyncAfter(deadline: .now() + 10) { if !self.gotRequest { self.c.cancel() } }
         read()
     }
 
@@ -259,6 +299,7 @@ final class Conn {
         c.receive(minimumIncompleteLength: 1, maximumLength: 16384) { data, _, done, err in
             if let data { self.buf.append(data) }
             if let r = self.buf.range(of: Data("\r\n\r\n".utf8)) {
+                self.gotRequest = true
                 self.handle(String(decoding: self.buf[..<r.lowerBound], as: UTF8.self))
             } else if done || err != nil || self.buf.count > 65536 {
                 self.c.cancel()
@@ -281,7 +322,7 @@ final class Conn {
 
     private func header(_ status: String, _ fields: [(String, String)]) -> Data {
         var s = "HTTP/1.1 \(status)\r\n"
-        for (k, v) in fields + [("Connection", "close"), ("X-Content-Type-Options", "nosniff"),
+        for (k, v) in fields + [("Connection", "close"), ("X-Content-Type-Options", "nosniff"), ("Cache-Control", "private, no-store"),
                                      ("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'"),
                                      ("Referrer-Policy", "no-referrer")] {
             s += "\(k): \(v)\r\n"
@@ -291,7 +332,7 @@ final class Conn {
 
     private func text(_ status: String, _ body: String, type: String = "text/plain; charset=utf-8", headOnly: Bool = false) {
         let b = Data(body.utf8)
-        var d = header(status, [("Content-Type", type), ("Content-Length", "\(b.count)"), ("Cache-Control", "no-store")])
+        var d = header(status, [("Content-Type", type), ("Content-Length", "\(b.count)")])
         if !headOnly { d.append(b) }
         send(d) { self.close() }
     }
@@ -322,17 +363,27 @@ final class Conn {
         }
 
         let path = String(parts[1].split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false)[0])
-        let comps = path.split(separator: "/").map(String.init)
+        var comps = path.split(separator: "/").map(String.init)
+        // 3) tailscale serve가 붙이는 비밀 경로로 들어온 요청만 받는다 -> 로컬 포트로 직접 온 요청 차단
+        guard comps.first == upstreamSecret else {
+            return text("404 Not Found", "not found\n", headOnly: headOnly)
+        }
+        comps.removeFirst()
         if comps.isEmpty {
             return text("200 OK", indexPage(), type: "text/html; charset=utf-8", headOnly: headOnly)
         }
         guard comps.count >= 2, comps[0] == "s", let share = store.get(comps[1]) else {
             return text("404 Not Found", "링크가 없거나 만료되었습니다.\n", headOnly: headOnly)
         }
+        // 복사한 뒤에 경로가 민감한 곳을 가리키도록 바뀌었을 수 있으므로(심볼릭 링크 등) 보낼 때 다시 확인한다.
+        guard !share.paths.contains(where: isSensitive) else {
+            return text("404 Not Found", "링크가 없거나 만료되었습니다.\n", headOnly: headOnly)
+        }
         guard share.paths.allSatisfy({ FileManager.default.fileExists(atPath: $0) }) else {
             return text("404 Not Found", "원본 파일이 이동되었거나 삭제되었습니다.\n", headOnly: headOnly)
         }
-        what = "\(share.name) <- \(headers["x-forwarded-for"] ?? "?")"
+        let peer = (headers["x-forwarded-for"] ?? "?").filter { $0.isHexDigit || ".:, ".contains($0) }.prefix(64)
+        what = "\(share.name) <- \(peer)"
         if !headOnly { log("다운로드 시작: \(what)") }
         let disposition = ("Content-Disposition", "attachment; filename*=UTF-8''\(pctEncode(share.name))")
         if share.isArchive {
@@ -405,14 +456,15 @@ final class Conn {
         let names: [String]
         if parents.count == 1 {
             cwd = parents.first!
-            names = share.paths.map { ($0 as NSString).lastPathComponent }
+            names = share.paths.map { "./" + ($0 as NSString).lastPathComponent }
         } else {
             cwd = "/"
-            names = share.paths.map { String($0.dropFirst()) }
+            names = share.paths.map { "." + $0 }
         }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/zip")
-        p.arguments = ["-r", "-q", "-y", "-", "--"] + names
+        // 이름은 모두 "./"로 시작하므로 옵션으로 해석되지 않는다. 폴더 안의 민감한 파일은 제외한다.
+        p.arguments = ["-r", "-q", "-y", "-"] + names + ["-x"] + zipExcludes
         p.currentDirectoryURL = URL(fileURLWithPath: cwd)
         let out = Pipe()
         p.standardOutput = out
@@ -456,20 +508,44 @@ func startServer() throws -> NWListener {
 // MARK: - 클립보드 감시 + 메뉴 막대
 
 /// 복사만으로 공유되면 곤란한 것들. 이런 파일은 복사해도 링크를 만들지 않는다.
-func isSensitive(_ path: String) -> Bool {
-    let home = NSHomeDirectory()
-    let dirs = [".ssh", ".gnupg", ".aws", ".kube", ".docker", ".config/gcloud", ".password-store",
-                "Library/Keychains", "Library/Application Support/copypaste"]
-    for d in dirs {
-        let full = home + "/" + d
-        if path == full || path.hasPrefix(full + "/") { return true }
+/// 심볼릭 링크는 실제 위치로 풀어서 판단하고, 대소문자를 구분하지 않는다.
+let sensitiveDirs = [".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker", ".config/gcloud", ".config/gh",
+                     ".password-store", "Library/Keychains", "Library/Cookies",
+                     "Library/Application Support/copypaste"]
+let sensitiveNames: Set<String> = [".env", ".netrc", ".npmrc", ".pypirc", ".git-credentials", ".pgpass", "credentials.json"]
+let sensitivePrefixes = [".env.", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"]
+let sensitiveExtensions: Set<String> = ["pem", "p12", "pfx", "keychain", "keychain-db", "kdbx", "ovpn"]
+
+func isSensitive(_ rawPath: String) -> Bool {
+    let path = URL(fileURLWithPath: rawPath).resolvingSymlinksInPath().path.lowercased()
+    let home = URL(fileURLWithPath: NSHomeDirectory()).resolvingSymlinksInPath().path.lowercased()
+    func contains(_ outer: String, _ inner: String) -> Bool {
+        outer == inner || inner.hasPrefix(outer == "/" ? "/" : outer + "/")
     }
-    if path == home || path == "/" { return true }
-    let name = (path as NSString).lastPathComponent.lowercased()
-    if name == ".env" || name.hasPrefix(".env.") || name.hasPrefix("id_rsa") || name.hasPrefix("id_ed25519")
-        || name.hasPrefix("id_ecdsa") || name == ".netrc" || name == ".npmrc" { return true }
-    return ["pem", "key", "p12", "pfx", "keychain", "keychain-db", "kdbx"].contains((name as NSString).pathExtension)
+    // 홈 폴더 자체나 그 상위 폴더 전체
+    if contains(path, home) { return true }
+    for d in sensitiveDirs {
+        let full = home + "/" + d.lowercased()
+        // 민감한 폴더 안이거나, 민감한 폴더를 통째로 품은 상위 폴더(~/Library, ~/.config 등)
+        if contains(full, path) || contains(path, full) { return true }
+    }
+    let name = (path as NSString).lastPathComponent
+    // .key 는 개인 키일 수도, Keynote 문서일 수도 있다. Keynote(zip 형식 또는 폴더)만 통과시킨다.
+    if (name as NSString).pathExtension == "key" {
+        var isDir: ObjCBool = false
+        FileManager.default.fileExists(atPath: path, isDirectory: &isDir)
+        let magic = isDir.boolValue ? nil : FileHandle(forReadingAtPath: path).flatMap { try? $0.read(upToCount: 2) }
+        if !isDir.boolValue && magic != Data("PK".utf8) { return true }
+    }
+    return sensitiveNames.contains(name) || sensitivePrefixes.contains(where: name.hasPrefix)
+        || sensitiveExtensions.contains((name as NSString).pathExtension)
 }
+
+/// 폴더를 zip으로 묶을 때 안에 들어 있는 민감한 파일을 빼는 패턴.
+let zipExcludes: [String] = sensitiveNames.sorted().map { "*/" + $0 }
+    + sensitivePrefixes.map { "*/" + $0 + "*" }
+    + sensitiveExtensions.sorted().map { "*." + $0 }
+    + ["*/.ssh/*", "*/.gnupg/*", "*/.aws/*", "*/.kube/*"]
 
 final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var statusItem: NSStatusItem!
