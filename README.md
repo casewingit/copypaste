@@ -23,7 +23,7 @@ Finder에서 build.zip ⌘C
 
 `~/Applications/Copypaste.app` 으로 설치되고 로그인할 때 자동 실행됩니다. 제거는 `./uninstall.sh` 입니다.
 
-Swift 컴파일러가 없는 Mac에서는 `build/Copypaste.app` 이 들어 있는 폴더째로 옮긴 뒤 `./install.sh` 를 실행하면 빌드 없이 설치됩니다.
+Swift 컴파일러가 없는 Mac에서는 GitHub Releases의 `copypaste-installer.zip` 을 받아 압축을 풀고 `./install.sh` 를 실행하면 빌드 없이 설치됩니다(미리 빌드한 유니버설 앱 포함).
 
 ## 메뉴 막대
 
