@@ -325,6 +325,7 @@ final class Conn {
         guard share.paths.allSatisfy({ FileManager.default.fileExists(atPath: $0) }) else {
             return text("404 Not Found", "원본 파일이 이동되었거나 삭제되었습니다.\n", headOnly: headOnly)
         }
+        if !headOnly { log("다운로드: \(share.name) <- \(headers["x-forwarded-for"] ?? "?")") }
         let disposition = ("Content-Disposition", "attachment; filename*=UTF-8''\(pctEncode(share.name))")
         if share.isArchive {
             sendArchive(share, disposition, headOnly)
