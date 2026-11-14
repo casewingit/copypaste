@@ -114,8 +114,8 @@ final class Tailscale {
     var identity: Identity? { lock.lock(); defer { lock.unlock() }; return _identity }
 
     private var binary: String? {
-        ["/usr/local/bin/tailscale", "/opt/homebrew/bin/tailscale",
-         "/Applications/Tailscale.app/Contents/MacOS/Tailscale"]
+        ["/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+         "/usr/local/bin/tailscale", "/opt/homebrew/bin/tailscale"]
             .first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
@@ -124,6 +124,11 @@ final class Tailscale {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: bin)
         p.arguments = args
+        // Tailscale.app의 실행 파일은 터미널 밖에서 부르면 GUI로 뜨려다 실패한다. CLI로 동작하게 강제한다.
+        var e = ProcessInfo.processInfo.environment
+        e["TAILSCALE_BE_CLI"] = "1"
+        p.environment = e
+        p.standardInput = FileHandle.nullDevice
         let out = Pipe()
         p.standardOutput = out
         p.standardError = out
@@ -170,7 +175,8 @@ final class Tailscale {
                 log("tailscale: \(dns) (\(login))")
                 self.ensureServe(host: dns)
             } else {
-                log("tailscale 상태를 읽지 못함, 30초 뒤 재시도")
+                let msg = String(decoding: data.prefix(200), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+                log("tailscale 상태를 읽지 못함(\(self.binary ?? "실행 파일 없음"), 종료 코드 \(code)): \(msg) — 30초 뒤 재시도")
                 DispatchQueue.global().asyncAfter(deadline: .now() + 30) { self.setup() }
             }
         }
