@@ -14,6 +14,19 @@ let publicPort = UInt16(env["COPYPASTE_PORT"] ?? "") ?? 8765
 let shareTTL: TimeInterval = (Double(env["COPYPASTE_TTL_HOURS"] ?? "") ?? 24) * 3600
 let markerType = NSPasteboard.PasteboardType("com.copypaste.marker")
 
+/// 로그가 1MB를 넘으면 시작할 때 끝부분 200KB만 남긴다.
+func trimLog() {
+    let path = NSHomeDirectory() + "/Library/Logs/copypaste.log"
+    guard let size = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? NSNumber)?.intValue, size > 1_000_000,
+          let fh = FileHandle(forUpdatingAtPath: path) else { return }
+    try? fh.seek(toOffset: UInt64(size - 200_000))
+    let tail = (try? fh.readToEnd()) ?? Data()
+    try? fh.truncate(atOffset: 0)
+    try? fh.seek(toOffset: 0)
+    try? fh.write(contentsOf: tail)
+    try? fh.close()
+}
+
 func log(_ s: String) {
     FileHandle.standardError.write("[\(ISO8601DateFormatter().string(from: Date()))] \(s)\n".data(using: .utf8)!)
 }
@@ -129,6 +142,15 @@ final class Tailscale {
     private var _identity: Identity?
     var identity: Identity? { lock.lock(); defer { lock.unlock() }; return _identity }
 
+    /// 링크를 만들 수 없는 이유. nil이면 정상. 메뉴 막대에 그대로 보여 준다.
+    private var _problem: String? = "Tailscale 연결 확인 중…"
+    var problem: String? { lock.lock(); defer { lock.unlock() }; return _problem }
+    private func set(problem: String?) {
+        lock.lock(); let changed = _problem != problem; _problem = problem; lock.unlock()
+        if changed, let problem { log("사용 불가: \(problem)") }
+        if changed { DispatchQueue.main.async { delegate.refreshIcon() } }
+    }
+
     private var binary: String? {
         ["/Applications/Tailscale.app/Contents/MacOS/Tailscale",
          "/usr/local/bin/tailscale", "/opt/homebrew/bin/tailscale"]
@@ -149,31 +171,42 @@ final class Tailscale {
         p.standardOutput = out
         p.standardError = out
         do { try p.run() } catch { return (-1, Data()) }
+        // 사용자 입력을 기다리며 멈추는 경우(예: serve 사용 동의 대기)에 대비해 20초로 제한한다.
+        let killer = DispatchWorkItem { if p.isRunning { p.terminate() } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 20, execute: killer)
         let d = out.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
+        killer.cancel()
         return (p.terminationStatus, d)
     }
 
     /// 이 포트에 이미 다른 serve 설정이 있으면 절대 덮어쓰지 않는다.
-    private func ensureServe(host: String) {
+    private func ensureServe(host: String) -> String? {
         let base = "http://127.0.0.1:\(localPort)"
         let target = base + "/" + upstreamSecret
         let (sc, sd) = run(["serve", "status", "--json"])
-        guard sc == 0 else { return log("tailscale serve 상태를 읽지 못해 설정을 건드리지 않음") }
+        guard sc == 0 else { return "tailscale serve 상태를 읽지 못했습니다" }
         let cfg = (try? JSONSerialization.jsonObject(with: sd) as? [String: Any]) ?? [:]
         let tcp = cfg["TCP"] as? [String: Any] ?? [:]
         let web = cfg["Web"] as? [String: Any] ?? [:]
         if tcp["\(publicPort)"] != nil {
             let handlers = (web["\(host):\(publicPort)"] as? [String: Any])?["Handlers"] as? [String: Any] ?? [:]
             let proxy = handlers.count == 1 ? (handlers["/"] as? [String: Any])?["Proxy"] as? String : nil
-            if proxy == target { return }
+            if proxy == target { return nil }
             // 우리 로컬 포트를 가리키는 예전 설정(비밀 경로 없음/바뀜)만 갱신하고, 남의 설정은 건드리지 않는다.
             guard let proxy, proxy == base || proxy.hasPrefix(base + "/") else {
-                return log("포트 \(publicPort)에 이미 다른 tailscale serve 설정이 있어 건드리지 않음. COPYPASTE_PORT로 다른 포트를 지정하세요.")
+                return "포트 \(publicPort)를 다른 tailscale serve 설정이 쓰고 있습니다 (COPYPASTE_PORT로 변경 후 재설치)"
             }
         }
         let (c, out) = run(["serve", "--bg", "--https=\(publicPort)", target])
-        if c != 0 { log("tailscale serve 실패: \(String(data: out, encoding: .utf8) ?? "")") }
+        if c == 0 { return nil }
+        let msg = String(decoding: out, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        log("tailscale serve 실패: \(msg)")
+        // 가장 흔한 원인: tailnet에서 HTTPS 인증서(또는 serve)가 아직 켜져 있지 않음
+        if let url = msg.split(whereSeparator: { $0 == " " || $0 == "\n" }).first(where: { $0.hasPrefix("https://login.tailscale.com") }) {
+            return "Tailscale에서 HTTPS/Serve를 켜야 합니다: \(url)"
+        }
+        return "tailscale serve 설정 실패 (로그 확인)"
     }
 
     /// 기기 이름과 계정을 읽고 tailscale serve를 켠다. 실패하면 30초 뒤 다시 시도한다.
@@ -191,12 +224,27 @@ final class Tailscale {
                    let u = users[uid.stringValue] as? [String: Any] {
                     login = u["LoginName"] as? String ?? ""
                 }
-                self.lock.lock(); self._identity = Identity(host: dns, login: login); self.lock.unlock()
-                log("tailscale: \(dns) (\(login))")
-                self.ensureServe(host: dns)
+                self.lock.lock()
+                let first = self._identity == nil
+                self._identity = Identity(host: dns, login: login)
+                self.lock.unlock()
+                if first { log("tailscale: \(dns) (\(login))") }
+                if login.isEmpty || login == "tagged-devices" {
+                    // 계정이 없는 기기는 "같은 계정" 확인을 할 수 없으므로 서비스하지 않는다.
+                    self.set(problem: "태그된 기기에서는 사용할 수 없습니다 (소유 계정 없음)")
+                } else {
+                    let problem = self.ensureServe(host: dns)
+                    if problem == nil && self.problem != nil { log("준비 완료: https://\(dns):\(publicPort)/") }
+                    self.set(problem: problem)
+                }
+                // 기기 이름이 바뀌거나 serve 설정이 지워진 경우를 위해 10분마다 다시 확인한다.
+                DispatchQueue.global().asyncAfter(deadline: .now() + (self.problem == nil ? 600 : 30)) { self.setup() }
             } else {
-                let msg = String(decoding: data.prefix(200), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-                log("tailscale 상태를 읽지 못함(\(self.binary ?? "실행 파일 없음"), 종료 코드 \(code)): \(msg) — 30초 뒤 재시도")
+                var why = self.binary == nil ? "Tailscale 앱을 찾을 수 없습니다" : "Tailscale에 로그인되어 있지 않거나 꺼져 있습니다"
+                if code == 0, let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let st = j["BackendState"] as? String, st != "Running" { why += " (\(st))" }
+                self.lock.lock(); self._identity = nil; self.lock.unlock()
+                self.set(problem: why)
                 DispatchQueue.global().asyncAfter(deadline: .now() + 30) { self.setup() }
             }
         }
@@ -212,7 +260,7 @@ func pctEncode(_ s: String) -> String {
 }
 
 func link(for s: Share) -> String? {
-    guard let id = tailscale.identity else { return nil }
+    guard tailscale.problem == nil, let id = tailscale.identity else { return nil }
     return "https://\(id.host):\(publicPort)/s/\(s.token)/\(pctEncode(s.name))"
 }
 
@@ -558,7 +606,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             log("포트 \(localPort)를 열 수 없음: \(error)")
             exit(1)
         }
-        tailscale.setup()
+        trimLog()
         if #available(macOS 15.4, *) {
             // 시스템 설정 > 개인정보 보호 및 보안 > "다른 앱에서 붙여넣기"의 현재 값
             let names: [NSPasteboard.AccessBehavior: String] = [.default: "default", .ask: "ask", .alwaysAllow: "alwaysAllow", .alwaysDeny: "alwaysDeny"]
@@ -566,13 +614,20 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        setIcon("link")
+        refreshIcon()
+        tailscale.setup()
         let menu = NSMenu()
         menu.delegate = self
         statusItem.menu = menu
 
         let t = Timer(timeInterval: 0.4, repeats: true) { _ in self.checkPasteboard() }
+        t.tolerance = 0.2 // 시스템이 깨우는 시점을 다른 작업과 묶을 수 있게 해 전력 소모를 줄인다
         RunLoop.main.add(t, forMode: .common)
+    }
+
+    func refreshIcon() {
+        guard statusItem != nil else { return }
+        setIcon(tailscale.problem != nil ? "exclamationmark.triangle" : paused ? "pause.circle" : "link")
     }
 
     func setIcon(_ symbol: String) {
@@ -600,7 +655,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let blocked = paths.first(where: isSensitive) {
             return log("민감한 경로라 공유하지 않음: \((blocked as NSString).lastPathComponent)")
         }
-        guard tailscale.identity != nil else { return log("Tailscale 기기 이름을 아직 몰라 링크를 만들지 않음") }
+        if let problem = tailscale.problem { return log("링크를 만들지 않음: \(problem)") }
 
         // 파일 정보는 그대로 두고 텍스트만 링크로 바꾼다.
         // -> Finder에 붙여넣으면 파일, 텍스트 칸에 붙여넣으면 링크.
@@ -637,13 +692,17 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         log("공유: \(share.name)")
 
         setIcon("checkmark.circle.fill")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { self.setIcon(self.paused ? "pause.circle" : "link") }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { self.refreshIcon() }
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
-        let host = tailscale.identity?.host ?? "Tailscale 연결 확인 중…"
-        menu.addItem(withTitle: host, action: nil, keyEquivalent: "")
+        if let problem = tailscale.problem {
+            menu.addItem(withTitle: "⚠︎ " + problem, action: nil, keyEquivalent: "")
+            menu.addItem(withTitle: "로그 보기", action: #selector(openLog), keyEquivalent: "").target = self
+        } else {
+            menu.addItem(withTitle: tailscale.identity?.host ?? "", action: nil, keyEquivalent: "")
+        }
         menu.addItem(.separator())
         let shares = store.all().prefix(8)
         if shares.isEmpty {
@@ -676,12 +735,16 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func togglePause() {
         paused.toggle()
-        setIcon(paused ? "pause.circle" : "link")
+        refreshIcon()
     }
 
     @objc func openIndex() {
         guard let id = tailscale.identity, let u = URL(string: "https://\(id.host):\(publicPort)/") else { return }
         NSWorkspace.shared.open(u)
+    }
+
+    @objc func openLog() {
+        NSWorkspace.shared.open(URL(fileURLWithPath: NSHomeDirectory() + "/Library/Logs/copypaste.log"))
     }
 
     @objc func clearAll() { store.clear() }

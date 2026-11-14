@@ -13,17 +13,45 @@ Finder에서 build.zip ⌘C
 - 링크는 24시간 뒤 만료됩니다. 같은 파일을 다시 복사하면 같은 링크가 연장됩니다.
 - `https://<이 Mac>.ts.net:8765/` 에서 최근 공유 목록을 볼 수 있습니다. 상대 Mac에 즐겨찾기해 두면 링크를 옮길 필요가 없습니다.
 
+## 필요한 것
+
+- macOS 13 이상 (Apple Silicon, Intel 모두 지원)
+- [Tailscale](https://tailscale.com/download) 앱이 설치되어 로그인된 상태 (독립 실행판, App Store판, Homebrew판 모두 가능)
+- tailnet에서 **MagicDNS와 HTTPS 인증서**가 켜져 있어야 합니다. [관리 화면의 DNS 설정](https://login.tailscale.com/admin/dns)에서 켤 수 있습니다. 꺼져 있으면 설치 프로그램과 메뉴 막대가 켜는 주소를 알려 줍니다.
+- 사용자 계정으로 로그인된 기기여야 합니다. 태그된 기기(소유 계정 없음)에서는 동작하지 않습니다.
+
 ## 설치
 
-두 Mac에서 각각 실행합니다. Tailscale 앱이 로그인되어 있고 HTTPS 인증서가 켜져 있어야 합니다.
+파일을 주고받을 Mac마다 한 번씩 설치합니다.
+
+1. [Releases](../../releases/latest)에서 `copypaste-installer.zip` 을 받아 압축을 풉니다.
+2. 터미널에서 그 폴더로 이동해 실행합니다.
 
 ```bash
 bash install.sh
 ```
 
-`~/Applications/Copypaste.app` 으로 설치되고 로그인할 때 자동 실행됩니다. 제거는 `./uninstall.sh` 입니다.
+성공하면 공유 목록 주소가 출력되고 메뉴 막대에 링크 아이콘이 생깁니다. 링크를 만들 수 없는 상태면 이유를 알려 주며, 해결되면 30초 안에 자동으로 다시 시도합니다.
 
-Swift 컴파일러가 없는 Mac에서는 GitHub Releases의 `copypaste-installer.zip` 을 받아 압축을 풀고 폴더 안에서 `bash install.sh` 를 실행하면 빌드 없이 설치됩니다(미리 빌드한 유니버설 앱 포함).
+`~/Applications/Copypaste.app` 으로 설치되고 로그인할 때 자동 실행됩니다. 관리자 권한은 필요 없습니다. 업데이트는 새 zip으로 같은 명령을 다시 실행하면 되고, 제거는 `bash uninstall.sh` 입니다.
+
+소스에서 직접 빌드하려면 저장소를 받아 같은 명령을 실행합니다(Xcode 명령줄 도구 필요).
+
+### 처음 쓸 때 macOS가 묻는 것
+
+- 문서·데스크탑·다운로드 폴더의 파일을 처음 공유할 때 폴더 접근 허용을 묻습니다. 허용해야 그 폴더의 파일을 내려보낼 수 있습니다. 앱을 업데이트하면 다시 물을 수 있습니다.
+- 복사할 때마다 "붙여넣기 허용"을 묻는다면 시스템 설정 → 개인정보 보호 및 보안 → 다른 앱에서 붙여넣기에서 Copypaste를 "허용"으로 바꾸세요.
+
+### 문제 해결
+
+메뉴 막대 아이콘이 ⚠︎ 로 바뀌면 메뉴 맨 위에 원인이 나옵니다. 자세한 내용은 `~/Library/Logs/copypaste.log` 에 있습니다.
+
+| 증상 | 해결 |
+| --- | --- |
+| "HTTPS/Serve를 켜야 합니다" | 안내된 주소를 열어 tailnet에서 HTTPS를 켭니다 |
+| "포트 8765를 다른 tailscale serve 설정이 쓰고 있습니다" | `COPYPASTE_PORT=9000 bash install.sh` 처럼 다른 포트로 재설치 |
+| "Tailscale에 로그인되어 있지 않거나 꺼져 있습니다" | Tailscale을 켜고 로그인 |
+| 링크는 생기는데 다른 기기에서 403 | 그 기기가 같은 Tailscale 계정으로 로그인되어 있는지 확인 |
 
 ## 메뉴 막대
 
@@ -64,7 +92,9 @@ Swift 컴파일러가 없는 Mac에서는 GitHub Releases의 `copypaste-installe
 - 원본 클립보드 데이터를 전부 읽은 뒤 텍스트 부분만 바꿔 다시 씁니다. 하나라도 읽지 못하거나 그 사이 클립보드가 바뀌면 그대로 둡니다.
 - 포트 8765에 이미 다른 `tailscale serve` 설정이 있으면 덮어쓰지 않습니다.
 
-## 설정 (환경 변수)
+## 설정
+
+설치할 때 환경 변수로 지정합니다. 예: `COPYPASTE_PORT=9000 COPYPASTE_TTL_HOURS=2 bash install.sh`
 
 | 변수 | 기본값 | 뜻 |
 | --- | --- | --- |
@@ -72,4 +102,6 @@ Swift 컴파일러가 없는 Mac에서는 GitHub Releases의 `copypaste-installe
 | `COPYPASTE_LOCAL_PORT` | 48765 | 로컬 서버 포트 |
 | `COPYPASTE_TTL_HOURS` | 24 | 링크 유지 시간 |
 
-로그는 `~/Library/Logs/copypaste.log` 에 남습니다.
+## 자원 사용
+
+대기 중에는 메모리 약 35~45MB, CPU 0%입니다(클립보드 변경 여부만 0.4초마다 확인). 파일은 1MB씩 읽어 보내므로 수 GB 파일을 보내도 메모리 사용량이 늘지 않습니다. 폴더는 임시 파일 없이 바로 압축해 보냅니다. 로그는 1MB를 넘으면 자동으로 줄입니다.
