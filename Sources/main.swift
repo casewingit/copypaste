@@ -5,6 +5,7 @@
 
 import AppKit
 import Network
+import Security
 import ServiceManagement
 
 // MARK: - 설정
@@ -675,6 +676,11 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         t.tolerance = 0.2 // 시스템이 깨우는 시점을 다른 작업과 묶을 수 있게 해 전력 소모를 줄인다
         RunLoop.main.add(t, forMode: .common)
 
+        launchedIdentity = executableIdentity()
+        let u = Timer(timeInterval: 5, repeats: true) { _ in self.checkForReplacement() }
+        u.tolerance = 2
+        RunLoop.main.add(u, forMode: .common)
+
         firstRunSetup()
     }
 
@@ -715,19 +721,69 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if fm.fileExists(atPath: legacyAppPath) { try? fm.removeItem(atPath: legacyAppPath) }
     }
 
-    /// 이미 실행 중이면 조용히 끝낸다.
+    /// 먼저 떠 있던 Copypaste(업데이트 전 버전)는 내리고 이어받는다. 나보다 늦게 뜬 것이 있으면 내가 물러난다.
     func ensureSingleInstance() -> Bool {
-        let me = ProcessInfo.processInfo.processIdentifier
+        let me = NSRunningApplication.current
+        let myStart = me.launchDate ?? Date()
         func others() -> [NSRunningApplication] {
             NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "com.copypaste.agent")
-                .filter { $0.processIdentifier != me }
+                .filter { $0.processIdentifier != me.processIdentifier }
         }
-        for _ in 0..<15 where !others().isEmpty { usleep(200_000) } // 방금 내린 예전 버전이 끝나길 잠깐 기다림
-        guard others().isEmpty else {
+        func waitGone(_ tries: Int) -> Bool {
+            for _ in 0..<tries where !others().isEmpty { usleep(200_000) }
+            return others().isEmpty
+        }
+        if waitGone(5) { return true }
+        if others().contains(where: { ($0.launchDate ?? .distantPast) >= myStart }) {
             NSApp.terminate(nil)
             return false
         }
+        others().forEach { _ = $0.terminate() }
+        if !waitGone(15) {
+            others().forEach { _ = $0.forceTerminate() }
+            if !waitGone(10) {
+                NSApp.terminate(nil)
+                return false
+            }
+        }
+        log("먼저 실행 중이던 Copypaste를 종료하고 이어받음")
         return true
+    }
+
+    // MARK: 업데이트 감지
+
+    var launchedIdentity: String?
+    var pendingIdentity: String?
+
+    /// 지금 디스크에 있는 실행 파일의 신원. 앱이 교체되면 달라진다.
+    func executableIdentity() -> String? {
+        guard let path = Bundle.main.executablePath else { return nil }
+        var st = stat()
+        guard stat(path, &st) == 0 else { return nil }
+        return "\(st.st_ino)-\(st.st_mtimespec.tv_sec)-\(st.st_size)"
+    }
+
+    /// 복사가 끝나 서명이 온전한 앱인지 확인한다(복사 도중의 반쪽짜리 앱을 띄우지 않기 위해).
+    func bundleIsIntact() -> Bool {
+        var code: SecStaticCode?
+        guard SecStaticCodeCreateWithPath(Bundle.main.bundleURL as CFURL, [], &code) == errSecSuccess, let code else { return false }
+        return SecStaticCodeCheckValidity(code, [], nil) == errSecSuccess
+    }
+
+    /// 실행 중에 앱이 새 버전으로 덮어써지면 새 버전을 띄운다. 새 버전이 뜨면서 이 프로세스를 내린다.
+    func checkForReplacement() {
+        guard let id = executableIdentity(), id != launchedIdentity else { pendingIdentity = nil; return }
+        guard id == pendingIdentity else { pendingIdentity = id; return } // 두 번 연속 같아야 복사가 끝난 것
+        guard bundleIsIntact() else { return }
+        launchedIdentity = id
+        pendingIdentity = nil
+        log("앱이 교체된 것을 감지해 새 버전을 실행함")
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        p.arguments = ["-n", Bundle.main.bundlePath]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        try? p.run()
     }
 
     var launchAtLogin: Bool {
