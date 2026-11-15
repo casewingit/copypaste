@@ -5,18 +5,34 @@
 
 import AppKit
 import Network
+import ServiceManagement
 
 // MARK: - 설정
 
+// 바꾸려면: defaults write com.copypaste.agent port -int 9000  (그 뒤 앱을 다시 실행)
+// 환경 변수(COPYPASTE_PORT 등)가 있으면 그것이 우선한다.
 let env = ProcessInfo.processInfo.environment
-let localPort = UInt16(env["COPYPASTE_LOCAL_PORT"] ?? "") ?? 48765
-let publicPort = UInt16(env["COPYPASTE_PORT"] ?? "") ?? 8765
-let shareTTL: TimeInterval = (Double(env["COPYPASTE_TTL_HOURS"] ?? "") ?? 24) * 3600
+func setting(_ key: String, _ envName: String, _ fallback: Double) -> Double {
+    if let v = Double(env[envName] ?? "") { return v }
+    if let v = UserDefaults.standard.object(forKey: key) as? NSNumber { return v.doubleValue }
+    return fallback
+}
+func portSetting(_ key: String, _ envName: String, _ fallback: UInt16) -> UInt16 {
+    let v = setting(key, envName, Double(fallback))
+    return v >= 1024 && v <= 65535 ? UInt16(v) : fallback
+}
+let localPort = portSetting("localPort", "COPYPASTE_LOCAL_PORT", 48765)
+let publicPort = portSetting("port", "COPYPASTE_PORT", 8765)
+let shareTTL: TimeInterval = max(setting("ttlHours", "COPYPASTE_TTL_HOURS", 24), 0.1) * 3600
+let logPath = NSHomeDirectory() + "/Library/Logs/copypaste.log"
+let legacyAgentPlist = NSHomeDirectory() + "/Library/LaunchAgents/com.copypaste.agent.plist"
+let legacyAppPath = NSHomeDirectory() + "/Applications/Copypaste.app"
+let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
 let markerType = NSPasteboard.PasteboardType("com.copypaste.marker")
 
 /// 로그가 1MB를 넘으면 시작할 때 끝부분 200KB만 남긴다.
 func trimLog() {
-    let path = NSHomeDirectory() + "/Library/Logs/copypaste.log"
+    let path = logPath
     guard let size = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? NSNumber)?.intValue, size > 1_000_000,
           let fh = FileHandle(forUpdatingAtPath: path) else { return }
     try? fh.seek(toOffset: UInt64(size - 200_000))
@@ -27,8 +43,19 @@ func trimLog() {
     try? fh.close()
 }
 
+/// 로그는 본인만 읽을 수 있는 파일에 덧붙여 쓴다.
+let logHandle: FileHandle? = {
+    try? FileManager.default.createDirectory(atPath: (logPath as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+    let fd = open(logPath, O_WRONLY | O_APPEND | O_CREAT, 0o600)
+    if fd >= 0 { fchmod(fd, 0o600) }
+    return fd >= 0 ? FileHandle(fileDescriptor: fd, closeOnDealloc: true) : nil
+}()
+let logLock = NSLock()
+
 func log(_ s: String) {
-    FileHandle.standardError.write("[\(ISO8601DateFormatter().string(from: Date()))] \(s)\n".data(using: .utf8)!)
+    let line = Data("[\(ISO8601DateFormatter().string(from: Date()))] \(s)\n".utf8)
+    logLock.lock(); defer { logLock.unlock() }
+    try? logHandle?.write(contentsOf: line)
 }
 
 // MARK: - 공유 목록
@@ -207,6 +234,24 @@ final class Tailscale {
             return "Tailscale에서 HTTPS/Serve를 켜야 합니다: \(url)"
         }
         return "tailscale serve 설정 실패 (로그 확인)"
+    }
+
+    /// 제거할 때: 이 포트의 serve 설정이 우리 것일 때만 끈다.
+    func removeServe() {
+        var host = identity?.host
+        if host == nil, let j = try? JSONSerialization.jsonObject(with: run(["status", "--json"]).1) as? [String: Any],
+           var dns = (j["Self"] as? [String: Any])?["DNSName"] as? String {
+            if dns.hasSuffix(".") { dns.removeLast() }
+            host = dns
+        }
+        guard let host, !host.isEmpty else { return }
+        let (sc, sd) = run(["serve", "status", "--json"])
+        guard sc == 0, let cfg = try? JSONSerialization.jsonObject(with: sd) as? [String: Any],
+              let web = cfg["Web"] as? [String: Any],
+              let handlers = (web["\(host):\(publicPort)"] as? [String: Any])?["Handlers"] as? [String: Any],
+              let proxy = (handlers["/"] as? [String: Any])?["Proxy"] as? String,
+              proxy.hasPrefix("http://127.0.0.1:\(localPort)") else { return }
+        _ = run(["serve", "--https=\(publicPort)", "off"])
     }
 
     /// 기기 이름과 계정을 읽고 tailscale serve를 켠다. 실패하면 30초 뒤 다시 시도한다.
@@ -546,7 +591,7 @@ func startServer() throws -> NWListener {
     l.stateUpdateHandler = { state in
         if case .failed(let e) = state {
             log("서버 실패: \(e)")
-            exit(1) // launchd가 다시 띄운다
+            exit(1)
         }
     }
     l.start(queue: .global())
@@ -602,11 +647,17 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var paused = false
 
     func applicationDidFinishLaunching(_ n: Notification) {
+        guard checkLocation() else { return }
+        migrateLegacyInstall()
+        guard ensureSingleInstance() else { return }
+
         do { listener = try startServer() } catch {
             log("포트 \(localPort)를 열 수 없음: \(error)")
-            exit(1)
+            alert("Copypaste를 시작할 수 없습니다",
+                  "로컬 포트 \(localPort)를 다른 프로그램이 쓰고 있습니다.\n터미널에서 다음을 실행한 뒤 다시 여세요:\n\ndefaults write com.copypaste.agent localPort -int 48800")
+            return NSApp.terminate(nil)
         }
-        trimLog()
+        log("시작: Copypaste \(appVersion)")
         if #available(macOS 15.4, *) {
             // 시스템 설정 > 개인정보 보호 및 보안 > "다른 앱에서 붙여넣기"의 현재 값
             let names: [NSPasteboard.AccessBehavior: String] = [.default: "default", .ask: "ask", .alwaysAllow: "alwaysAllow", .alwaysDeny: "alwaysDeny"]
@@ -623,6 +674,77 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let t = Timer(timeInterval: 0.4, repeats: true) { _ in self.checkPasteboard() }
         t.tolerance = 0.2 // 시스템이 깨우는 시점을 다른 작업과 묶을 수 있게 해 전력 소모를 줄인다
         RunLoop.main.add(t, forMode: .common)
+
+        firstRunSetup()
+    }
+
+    func alert(_ title: String, _ text: String, buttons: [String] = ["확인"]) -> NSApplication.ModalResponse {
+        let a = NSAlert()
+        a.messageText = title
+        a.informativeText = text
+        buttons.forEach { a.addButton(withTitle: $0) }
+        NSApp.activate(ignoringOtherApps: true)
+        return a.runModal()
+    }
+
+    /// 디스크 이미지 안이나 임시 격리 위치에서 실행하면 자동 실행 등록이 깨지므로 먼저 옮기게 한다.
+    func checkLocation() -> Bool {
+        let path = Bundle.main.bundlePath
+        guard path.hasPrefix("/Volumes/") || path.contains("/AppTranslocation/") else { return true }
+        _ = alert("먼저 응용 프로그램 폴더로 옮겨 주세요",
+                  "Copypaste 아이콘을 응용 프로그램(Applications) 폴더로 끌어다 놓은 뒤, 그곳에서 열어 주세요.")
+        NSApp.terminate(nil)
+        return false
+    }
+
+    /// 예전 방식(install.sh가 만든 LaunchAgent와 ~/Applications 사본)을 정리한다.
+    func migrateLegacyInstall() {
+        let fm = FileManager.default
+        guard Bundle.main.bundlePath != legacyAppPath else { return }
+        if fm.fileExists(atPath: legacyAgentPlist) {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+            p.arguments = ["bootout", "gui/\(getuid())/com.copypaste.agent"]
+            p.standardOutput = FileHandle.nullDevice
+            p.standardError = FileHandle.nullDevice
+            try? p.run()
+            p.waitUntilExit()
+            try? fm.removeItem(atPath: legacyAgentPlist)
+            log("예전 자동 실행 설정을 정리함")
+        }
+        if fm.fileExists(atPath: legacyAppPath) { try? fm.removeItem(atPath: legacyAppPath) }
+    }
+
+    /// 이미 실행 중이면 조용히 끝낸다.
+    func ensureSingleInstance() -> Bool {
+        let me = ProcessInfo.processInfo.processIdentifier
+        func others() -> [NSRunningApplication] {
+            NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "com.copypaste.agent")
+                .filter { $0.processIdentifier != me }
+        }
+        for _ in 0..<15 where !others().isEmpty { usleep(200_000) } // 방금 내린 예전 버전이 끝나길 잠깐 기다림
+        guard others().isEmpty else {
+            NSApp.terminate(nil)
+            return false
+        }
+        return true
+    }
+
+    var launchAtLogin: Bool {
+        get { SMAppService.mainApp.status == .enabled }
+        set {
+            do { if newValue { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() } }
+            catch { log("로그인 시 자동 실행 설정 실패: \(error.localizedDescription)") }
+        }
+    }
+
+    /// 처음 실행할 때: 로그인 시 자동 실행을 켜고, 창이 없는 앱이라 어디 있는지 알려 준다.
+    func firstRunSetup() {
+        guard !UserDefaults.standard.bool(forKey: "didFirstRun") else { return }
+        UserDefaults.standard.set(true, forKey: "didFirstRun")
+        launchAtLogin = true
+        _ = alert("Copypaste가 메뉴 막대에서 실행 중입니다",
+                  "Finder에서 파일을 복사(⌘C)하면 같은 Tailscale 계정의 기기에서만 열리는 다운로드 링크가 클립보드에 함께 들어갑니다.\n\n화면 위쪽 메뉴 막대의 링크 아이콘에서 일시 정지, 자동 실행, 제거를 할 수 있습니다.")
     }
 
     func refreshIcon() {
@@ -722,6 +844,12 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(withTitle: "공유 목록 페이지 열기", action: #selector(openIndex), keyEquivalent: "").target = self
         menu.addItem(withTitle: "모든 공유 링크 끊기", action: #selector(clearAll), keyEquivalent: "").target = self
         menu.addItem(.separator())
+        let login = menu.addItem(withTitle: "로그인 시 자동 실행", action: #selector(toggleLogin), keyEquivalent: "")
+        login.target = self
+        login.state = launchAtLogin ? .on : .off
+        menu.addItem(withTitle: "Copypaste 제거…", action: #selector(uninstall), keyEquivalent: "").target = self
+        menu.addItem(withTitle: "버전 \(appVersion)", action: nil, keyEquivalent: "")
+        menu.addItem(.separator())
         menu.addItem(withTitle: "종료", action: #selector(quit), keyEquivalent: "q").target = self
     }
 
@@ -743,8 +871,32 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSWorkspace.shared.open(u)
     }
 
+    @objc func toggleLogin() { launchAtLogin.toggle() }
+
+    /// 남기는 것 없이 지운다: 자동 실행, tailscale serve 설정, 공유 목록·비밀 값, 설정, 앱 자체(휴지통으로).
+    @objc func uninstall() {
+        let r = alert("Copypaste를 제거할까요?",
+                      "자동 실행 등록, Tailscale 공유 설정, 공유 목록을 지우고 앱을 휴지통으로 옮깁니다. 만들어 둔 링크는 모두 끊깁니다.",
+                      buttons: ["제거", "취소"])
+        guard r == .alertFirstButtonReturn else { return }
+        listener?.cancel()
+        App.removeEverything()
+        NSApp.terminate(nil)
+    }
+
+    /// 메뉴의 "제거"와 `copypaste --uninstall` 이 함께 쓴다.
+    static func removeEverything() {
+        try? SMAppService.mainApp.unregister()
+        tailscale.removeServe()
+        let fm = FileManager.default
+        try? fm.removeItem(at: fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("copypaste"))
+        if let id = Bundle.main.bundleIdentifier { UserDefaults.standard.removePersistentDomain(forName: id) }
+        try? fm.removeItem(atPath: logPath)
+        try? fm.trashItem(at: Bundle.main.bundleURL, resultingItemURL: nil)
+    }
+
     @objc func openLog() {
-        NSWorkspace.shared.open(URL(fileURLWithPath: NSHomeDirectory() + "/Library/Logs/copypaste.log"))
+        NSWorkspace.shared.open(URL(fileURLWithPath: logPath))
     }
 
     @objc func clearAll() { store.clear() }
@@ -752,6 +904,18 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func quit() { NSApp.terminate(nil) }
 }
 
+// 터미널에서 확인 없이 제거: /Applications/Copypaste.app/Contents/MacOS/copypaste --uninstall
+if CommandLine.arguments.contains("--uninstall") {
+    let me = ProcessInfo.processInfo.processIdentifier
+    NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "com.copypaste.agent")
+        .filter { $0.processIdentifier != me }.forEach { $0.terminate() }
+    usleep(800_000)
+    App.removeEverything()
+    print("Copypaste를 제거했습니다.")
+    exit(0)
+}
+
+trimLog()
 let app = NSApplication.shared
 let delegate = App()
 app.delegate = delegate

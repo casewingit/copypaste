@@ -24,18 +24,20 @@ Finder에서 build.zip ⌘C
 
 파일을 주고받을 Mac마다 한 번씩 설치합니다.
 
-1. [Releases](../../releases/latest)에서 `copypaste-installer.zip` 을 받아 압축을 풉니다.
-2. 터미널에서 그 폴더로 이동해 실행합니다.
+1. [Releases](../../releases/latest)에서 `Copypaste-<버전>.dmg` 를 받아 엽니다.
+2. 열린 창에서 **Copypaste 아이콘을 응용 프로그램(Applications) 폴더로 끌어다 놓습니다.**
+3. 응용 프로그램 폴더에서 Copypaste를 엽니다.
 
-```bash
-bash install.sh
-```
+처음 열 때 macOS가 "확인되지 않은 개발자"라며 막습니다(Apple 공증을 받지 않은 앱이기 때문입니다). 한 번만 허용하면 됩니다.
 
-성공하면 공유 목록 주소가 출력되고 메뉴 막대에 링크 아이콘이 생깁니다. 링크를 만들 수 없는 상태면 이유를 알려 주며, 해결되면 30초 안에 자동으로 다시 시도합니다.
+- **시스템 설정 → 개인정보 보호 및 보안**으로 가서 아래쪽의 "Copypaste" 항목 옆 **그래도 열기**를 누릅니다.
+- 또는 터미널에서 `xattr -dr com.apple.quarantine /Applications/Copypaste.app` 을 실행한 뒤 다시 엽니다.
 
-`~/Applications/Copypaste.app` 으로 설치되고 로그인할 때 자동 실행됩니다. 관리자 권한은 필요 없습니다. 업데이트는 새 zip으로 같은 명령을 다시 실행하면 되고, 제거는 `bash uninstall.sh` 입니다.
+열리면 안내 창이 한 번 뜨고 메뉴 막대에 링크 아이콘이 생깁니다. 로그인할 때 자동으로 실행되도록 등록되며, 메뉴에서 끌 수 있습니다. 관리자 권한은 필요 없습니다.
 
-소스에서 직접 빌드하려면 저장소를 받아 같은 명령을 실행합니다(Xcode 명령줄 도구 필요).
+- **업데이트**: 새 DMG의 앱을 응용 프로그램 폴더에 덮어쓴 뒤 다시 엽니다. 예전 방식(`install.sh`)으로 설치했던 것은 처음 열 때 자동으로 정리됩니다.
+- **제거**: 메뉴 막대 아이콘 → **Copypaste 제거…** 를 누르면 자동 실행 등록, Tailscale 공유 설정, 공유 목록을 지우고 앱을 휴지통으로 옮깁니다. 앱만 휴지통에 버리면 Tailscale 공유 설정이 남습니다.
+- **소스에서 빌드**: 저장소를 받아 `bash install.sh` (Xcode 명령줄 도구 필요). DMG는 `bash scripts/make-dmg.sh` 로 만듭니다.
 
 ### 처음 쓸 때 macOS가 묻는 것
 
@@ -44,12 +46,12 @@ bash install.sh
 
 ### 문제 해결
 
-메뉴 막대 아이콘이 ⚠︎ 로 바뀌면 메뉴 맨 위에 원인이 나옵니다. 자세한 내용은 `~/Library/Logs/copypaste.log` 에 있습니다.
+메뉴 막대 아이콘이 ⚠︎ 로 바뀌면 메뉴 맨 위에 원인이 나옵니다. 자세한 내용은 메뉴의 "로그 보기"(`~/Library/Logs/copypaste.log`)에 있습니다.
 
 | 증상 | 해결 |
 | --- | --- |
 | "HTTPS/Serve를 켜야 합니다" | 안내된 주소를 열어 tailnet에서 HTTPS를 켭니다 |
-| "포트 8765를 다른 tailscale serve 설정이 쓰고 있습니다" | `COPYPASTE_PORT=9000 bash install.sh` 처럼 다른 포트로 재설치 |
+| "포트 8765를 다른 tailscale serve 설정이 쓰고 있습니다" | `defaults write com.copypaste.agent port -int 9000` 실행 후 앱을 종료했다가 다시 열기 |
 | "Tailscale에 로그인되어 있지 않거나 꺼져 있습니다" | Tailscale을 켜고 로그인 |
 | 링크는 생기는데 다른 기기에서 403 | 그 기기가 같은 Tailscale 계정으로 로그인되어 있는지 확인 |
 
@@ -82,7 +84,7 @@ bash install.sh
 - 이 Mac에서 같은 사용자 계정으로 실행되는 악성 프로그램까지는 막지 못합니다(그런 프로그램은 이미 파일을 직접 읽을 수 있습니다).
 - 링크는 클립보드에 들어가므로 클립보드 기록 앱이나 공통 클립보드에도 남습니다. 링크만으로는 받을 수 없고 계정 확인을 통과해야 합니다.
 - Tailscale HTTPS 인증서는 공개 인증서 투명성 로그에 기록되어 기기의 tailnet 이름(`<기기>.<tailnet>.ts.net`)이 공개됩니다. 이름만 공개되며 접속은 되지 않습니다.
-- 릴리스의 앱은 임시(ad-hoc) 서명이고 Apple 공증을 받지 않았습니다. 릴리스 노트의 SHA-256으로 확인하거나 소스에서 직접 빌드하세요.
+- 릴리스의 앱은 임시(ad-hoc) 서명이고 Apple 공증을 받지 않아, 처음 열 때 macOS의 확인 절차를 한 번 거쳐야 합니다. 릴리스 노트의 SHA-256으로 확인하거나 소스에서 직접 빌드하세요.
 
 취약점은 GitHub의 비공개 보안 제보(Security → Report a vulnerability)로 알려 주세요.
 
@@ -94,13 +96,13 @@ bash install.sh
 
 ## 설정
 
-설치할 때 환경 변수로 지정합니다. 예: `COPYPASTE_PORT=9000 COPYPASTE_TTL_HOURS=2 bash install.sh`
+터미널에서 값을 바꾼 뒤 앱을 종료했다가 다시 엽니다. 예: `defaults write com.copypaste.agent ttlHours -int 2`
 
-| 변수 | 기본값 | 뜻 |
+| 키 | 기본값 | 뜻 |
 | --- | --- | --- |
-| `COPYPASTE_PORT` | 8765 | tailnet에 노출되는 HTTPS 포트 |
-| `COPYPASTE_LOCAL_PORT` | 48765 | 로컬 서버 포트 |
-| `COPYPASTE_TTL_HOURS` | 24 | 링크 유지 시간 |
+| `port` | 8765 | tailnet에 노출되는 HTTPS 포트 |
+| `localPort` | 48765 | 로컬 서버 포트 |
+| `ttlHours` | 24 | 링크 유지 시간 |
 
 ## 자원 사용
 
